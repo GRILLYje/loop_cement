@@ -64,7 +64,10 @@ function App() {
                 // Check if timer already exists (avoid duplicates)
                 const exists = prevTimers.find(t => t.id === newTimer.id)
                 if (!exists) {
-                  return [newTimer, ...prevTimers] // Add to beginning
+                  // Add and sort by remaining seconds (ascending)
+                  const updated = [...prevTimers, newTimer]
+                  updated.sort((a, b) => a.remainingSeconds - b.remainingSeconds)
+                  return updated
                 }
                 return prevTimers
               })
@@ -83,6 +86,20 @@ function App() {
               setTimers(prevTimers => {
                 const existingIndex = prevTimers.findIndex(t => t.id === updatedTimer.id)
                 if (existingIndex >= 0) {
+                  const existingTimer = prevTimers[existingIndex]
+                  
+                  // Only update if timer is running and the update is from another client
+                  // If it's our own timer running, ignore realtime updates to prevent double counting
+                  if (existingTimer.status === 'running' && updatedTimer.status === 'running') {
+                    // Only sync if the difference is significant (more than 2 seconds)
+                    // This prevents rapid updates from causing double counting
+                    const timeDiff = Math.abs(existingTimer.remainingSeconds - updatedTimer.remainingSeconds)
+                    if (timeDiff <= 2) {
+                      // Too close, ignore to prevent double counting
+                      return prevTimers
+                    }
+                  }
+                  
                   // Update existing timer
                   const updated = [...prevTimers]
                   updated[existingIndex] = updatedTimer
@@ -93,10 +110,14 @@ function App() {
                     delete intervalRefs.current[updatedTimer.id]
                   }
                   
+                  // Sort by remaining seconds (ascending - least time first)
+                  updated.sort((a, b) => a.remainingSeconds - b.remainingSeconds)
                   return updated
                 } else {
-                  // Timer not found, add it (shouldn't happen but handle it)
-                  return [updatedTimer, ...prevTimers]
+                  // Timer not found, add it and sort
+                  const updated = [...prevTimers, updatedTimer]
+                  updated.sort((a, b) => a.remainingSeconds - b.remainingSeconds)
+                  return updated
                 }
               })
             }
@@ -123,71 +144,64 @@ function App() {
   }, [])
 
   useEffect(() => {
-    // Update countdown for running timers and sync to database
+    // Update countdown for running timers - use local state for countdown
     timers.forEach(timer => {
       if (timer.status === 'running') {
         if (!intervalRefs.current[timer.id]) {
-          intervalRefs.current[timer.id] = setInterval(async () => {
-            // Get latest timer state from database first
-            const { data } = await supabase
-              .from('timers')
-              .select('*')
-              .eq('id', timer.id)
-              .single()
-
-            if (data) {
-              const dbTimer: Timer = {
-                id: data.id,
-                name: data.name,
-                initialSeconds: data.initial_seconds,
-                remainingSeconds: data.remaining_seconds,
-                status: data.status as Timer['status']
-              }
-
-              // Only update if timer is still running
-              if (dbTimer.status === 'running' && dbTimer.remainingSeconds > 0) {
-                // Decrement and save to database every second for real-time sync
-                const newRemainingSeconds = dbTimer.remainingSeconds - 1
-                
-                if (newRemainingSeconds > 0) {
-                  // Update in database
-                  await supabase
-                    .from('timers')
-                    .update({
-                      remaining_seconds: newRemainingSeconds,
-                      updated_at: new Date().toISOString()
-                    })
-                    .eq('id', timer.id)
-                  
-                  // Update local state (will be synced via realtime)
-                  setTimers(prevTimers =>
-                    prevTimers.map(t =>
-                      t.id === timer.id
-                        ? { ...t, remainingSeconds: newRemainingSeconds }
-                        : t
-                    )
-                  )
-                } else {
-                  // Timer finished
-                  await supabase
-                    .from('timers')
-                    .update({
-                      remaining_seconds: 0,
-                      status: 'finished',
-                      updated_at: new Date().toISOString()
-                    })
-                    .eq('id', timer.id)
-                  
-                  clearInterval(intervalRefs.current[timer.id])
-                  delete intervalRefs.current[timer.id]
+          const updateInterval = setInterval(() => {
+            setTimers(prevTimers => {
+              return prevTimers.map(t => {
+                if (t.id === timer.id && t.status === 'running') {
+                  if (t.remainingSeconds > 0) {
+                    const newRemainingSeconds = t.remainingSeconds - 1
+                    
+                    // Update database every 5 seconds to reduce API calls and prevent race conditions
+                    if (newRemainingSeconds > 0 && newRemainingSeconds % 5 === 0) {
+                      // Update database in background - don't wait for it
+                      supabase
+                        .from('timers')
+                        .update({
+                          remaining_seconds: newRemainingSeconds,
+                          updated_at: new Date().toISOString()
+                        })
+                        .eq('id', timer.id)
+                        .eq('status', 'running')
+                        .then(() => {
+                          // Ignore errors - realtime will sync
+                        })
+                        .catch(() => {
+                          // Ignore errors
+                        })
+                    }
+                    
+                    return { ...t, remainingSeconds: newRemainingSeconds }
+                  } else {
+                    // Timer finished
+                    clearInterval(intervalRefs.current[timer.id])
+                    delete intervalRefs.current[timer.id]
+                    
+                    // Update database
+                    supabase
+                      .from('timers')
+                      .update({
+                        remaining_seconds: 0,
+                        status: 'finished',
+                        updated_at: new Date().toISOString()
+                      })
+                      .eq('id', timer.id)
+                      .catch(() => {
+                        // Ignore errors
+                      })
+                    
+                    return { ...t, status: 'finished' as const, remainingSeconds: 0 }
+                  }
                 }
-              } else if (dbTimer.status !== 'running') {
-                // Timer was paused/stopped by another user
-                clearInterval(intervalRefs.current[timer.id])
-                delete intervalRefs.current[timer.id]
-              }
-            }
+                return t
+              })
+            })
           }, 1000)
+          
+          intervalRefs.current[timer.id] = updateInterval
         }
       } else {
         // Clear interval if timer is not running
@@ -216,6 +230,8 @@ function App() {
           remainingSeconds: t.remaining_seconds,
           status: t.status as Timer['status']
         }))
+        // Sort by remaining seconds (ascending - least time first)
+        loadedTimers.sort((a, b) => a.remainingSeconds - b.remainingSeconds)
         setTimers(loadedTimers)
       }
     } catch (error) {
