@@ -21,6 +21,7 @@ function App() {
   const [editingSeconds, setEditingSeconds] = useState<number>(30)
   const [editingName, setEditingName] = useState<string>('')
   const intervalRefs = useRef<{ [key: string]: ReturnType<typeof setInterval> }>({})
+  const countingTimers = useRef<Set<string>>(new Set()) // Track which timers we're actively counting
 
   // Load timers from database on mount
   useEffect(() => {
@@ -83,18 +84,22 @@ function App() {
                 status: payload.new.status as Timer['status']
               }
               
+              // Ignore realtime updates for timers we're actively counting locally
+              // This prevents double counting
+              if (countingTimers.current.has(updatedTimer.id) && updatedTimer.status === 'running') {
+                return // Ignore this update
+              }
+              
               setTimers(prevTimers => {
                 const existingIndex = prevTimers.findIndex(t => t.id === updatedTimer.id)
                 if (existingIndex >= 0) {
                   const existingTimer = prevTimers[existingIndex]
                   
-                  // Only update if timer is running and the update is from another client
-                  // If it's our own timer running, ignore realtime updates to prevent double counting
+                  // If timer is running and we're not counting it, sync from database
                   if (existingTimer.status === 'running' && updatedTimer.status === 'running') {
-                    // Only sync if the difference is significant (more than 2 seconds)
-                    // This prevents rapid updates from causing double counting
+                    // Only sync if difference is significant (more than 3 seconds)
                     const timeDiff = Math.abs(existingTimer.remainingSeconds - updatedTimer.remainingSeconds)
-                    if (timeDiff <= 2) {
+                    if (timeDiff <= 3) {
                       // Too close, ignore to prevent double counting
                       return prevTimers
                     }
@@ -108,6 +113,7 @@ function App() {
                   if (updatedTimer.status !== 'running' && intervalRefs.current[updatedTimer.id]) {
                     clearInterval(intervalRefs.current[updatedTimer.id])
                     delete intervalRefs.current[updatedTimer.id]
+                    countingTimers.current.delete(updatedTimer.id)
                   }
                   
                   // Sort by remaining seconds (ascending - least time first)
@@ -148,6 +154,9 @@ function App() {
     timers.forEach(timer => {
       if (timer.status === 'running') {
         if (!intervalRefs.current[timer.id]) {
+          // Mark this timer as being counted locally
+          countingTimers.current.add(timer.id)
+          
           const updateInterval = setInterval(() => {
             setTimers(prevTimers => {
               return prevTimers.map(t => {
@@ -155,10 +164,10 @@ function App() {
                   if (t.remainingSeconds > 0) {
                     const newRemainingSeconds = t.remainingSeconds - 1
                     
-                    // Update database every 5 seconds to reduce API calls and prevent race conditions
-                    if (newRemainingSeconds > 0 && newRemainingSeconds % 5 === 0) {
+                    // Update database every 10 seconds to reduce API calls and prevent race conditions
+                    if (newRemainingSeconds > 0 && newRemainingSeconds % 10 === 0) {
                       // Update database in background - don't wait for it
-                      supabase
+                      void supabase
                         .from('timers')
                         .update({
                           remaining_seconds: newRemainingSeconds,
@@ -166,12 +175,6 @@ function App() {
                         })
                         .eq('id', timer.id)
                         .eq('status', 'running')
-                        .then(() => {
-                          // Ignore errors - realtime will sync
-                        })
-                        .catch(() => {
-                          // Ignore errors
-                        })
                     }
                     
                     return { ...t, remainingSeconds: newRemainingSeconds }
@@ -179,9 +182,10 @@ function App() {
                     // Timer finished
                     clearInterval(intervalRefs.current[timer.id])
                     delete intervalRefs.current[timer.id]
+                    countingTimers.current.delete(timer.id)
                     
                     // Update database
-                    supabase
+                    void supabase
                       .from('timers')
                       .update({
                         remaining_seconds: 0,
@@ -189,9 +193,6 @@ function App() {
                         updated_at: new Date().toISOString()
                       })
                       .eq('id', timer.id)
-                      .catch(() => {
-                        // Ignore errors
-                      })
                     
                     return { ...t, status: 'finished' as const, remainingSeconds: 0 }
                   }
@@ -208,6 +209,7 @@ function App() {
         if (intervalRefs.current[timer.id]) {
           clearInterval(intervalRefs.current[timer.id])
           delete intervalRefs.current[timer.id]
+          countingTimers.current.delete(timer.id)
         }
       }
     })
@@ -262,19 +264,6 @@ function App() {
       console.error('Error saving timer:', error)
       // Fallback to local storage
       localStorage.setItem('timers', JSON.stringify(timers))
-    }
-  }
-
-  const deleteTimerFromDB = async (id: string) => {
-    try {
-      const { error } = await supabase
-        .from('timers')
-        .delete()
-        .eq('id', id)
-
-      if (error) throw error
-    } catch (error) {
-      console.error('Error deleting timer:', error)
     }
   }
 
