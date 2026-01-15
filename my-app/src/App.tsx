@@ -25,6 +25,65 @@ function App() {
   // Load timers from database on mount
   useEffect(() => {
     loadTimers()
+
+    // Subscribe to real-time changes
+    const channel = supabase
+      .channel('timers-changes')
+      .on(
+        'postgres_changes',
+        {
+          event: '*', // Listen to all events (INSERT, UPDATE, DELETE)
+          schema: 'public',
+          table: 'timers'
+        },
+        (payload) => {
+          console.log('Realtime update:', payload)
+          
+          if (payload.eventType === 'DELETE') {
+            // Remove deleted timer
+            setTimers(prevTimers => prevTimers.filter(t => t.id !== payload.old.id))
+            if (intervalRefs.current[payload.old.id]) {
+              clearInterval(intervalRefs.current[payload.old.id])
+              delete intervalRefs.current[payload.old.id]
+            }
+          } else if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
+            // Update or add timer
+            const updatedTimer: Timer = {
+              id: payload.new.id,
+              name: payload.new.name,
+              initialSeconds: payload.new.initial_seconds,
+              remainingSeconds: payload.new.remaining_seconds,
+              status: payload.new.status as Timer['status']
+            }
+            
+            setTimers(prevTimers => {
+              const existingIndex = prevTimers.findIndex(t => t.id === updatedTimer.id)
+              if (existingIndex >= 0) {
+                // Update existing timer
+                const updated = [...prevTimers]
+                updated[existingIndex] = updatedTimer
+                
+                // Handle status changes
+                if (updatedTimer.status !== 'running' && intervalRefs.current[updatedTimer.id]) {
+                  clearInterval(intervalRefs.current[updatedTimer.id])
+                  delete intervalRefs.current[updatedTimer.id]
+                }
+                
+                return updated
+              } else {
+                // Add new timer
+                return [...prevTimers, updatedTimer]
+              }
+            })
+          }
+        }
+      )
+      .subscribe()
+
+    // Cleanup subscription on unmount
+    return () => {
+      supabase.removeChannel(channel)
+    }
   }, [])
 
   useEffect(() => {
@@ -37,32 +96,70 @@ function App() {
   }, [])
 
   useEffect(() => {
-    // Update countdown for running timers
+    // Update countdown for running timers and sync to database
     timers.forEach(timer => {
       if (timer.status === 'running') {
         if (!intervalRefs.current[timer.id]) {
-          intervalRefs.current[timer.id] = setInterval(() => {
-            setTimers(prevTimers => {
-              return prevTimers.map(t => {
-                if (t.id === timer.id && t.status === 'running') {
-                  if (t.remainingSeconds > 0) {
-                    const updated = { ...t, remainingSeconds: t.remainingSeconds - 1 }
-                    // Save to DB every 5 seconds to reduce API calls
-                    if (updated.remainingSeconds % 5 === 0) {
-                      saveTimerToDB(updated)
-                    }
-                    return updated
-                  } else {
-                    clearInterval(intervalRefs.current[t.id])
-                    delete intervalRefs.current[t.id]
-                    const finished = { ...t, status: 'finished' as const, remainingSeconds: 0 }
-                    saveTimerToDB(finished)
-                    return finished
-                  }
+          intervalRefs.current[timer.id] = setInterval(async () => {
+            // Get latest timer state from database first
+            const { data } = await supabase
+              .from('timers')
+              .select('*')
+              .eq('id', timer.id)
+              .single()
+
+            if (data) {
+              const dbTimer: Timer = {
+                id: data.id,
+                name: data.name,
+                initialSeconds: data.initial_seconds,
+                remainingSeconds: data.remaining_seconds,
+                status: data.status as Timer['status']
+              }
+
+              // Only update if timer is still running
+              if (dbTimer.status === 'running' && dbTimer.remainingSeconds > 0) {
+                // Decrement and save to database every second for real-time sync
+                const newRemainingSeconds = dbTimer.remainingSeconds - 1
+                
+                if (newRemainingSeconds > 0) {
+                  // Update in database
+                  await supabase
+                    .from('timers')
+                    .update({
+                      remaining_seconds: newRemainingSeconds,
+                      updated_at: new Date().toISOString()
+                    })
+                    .eq('id', timer.id)
+                  
+                  // Update local state (will be synced via realtime)
+                  setTimers(prevTimers =>
+                    prevTimers.map(t =>
+                      t.id === timer.id
+                        ? { ...t, remainingSeconds: newRemainingSeconds }
+                        : t
+                    )
+                  )
+                } else {
+                  // Timer finished
+                  await supabase
+                    .from('timers')
+                    .update({
+                      remaining_seconds: 0,
+                      status: 'finished',
+                      updated_at: new Date().toISOString()
+                    })
+                    .eq('id', timer.id)
+                  
+                  clearInterval(intervalRefs.current[timer.id])
+                  delete intervalRefs.current[timer.id]
                 }
-                return t
-              })
-            })
+              } else if (dbTimer.status !== 'running') {
+                // Timer was paused/stopped by another user
+                clearInterval(intervalRefs.current[timer.id])
+                delete intervalRefs.current[timer.id]
+              }
+            }
           }, 1000)
         }
       } else {

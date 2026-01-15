@@ -56,6 +56,9 @@ CREATE POLICY "Allow all operations on timers" ON timers
   USING (true)
   WITH CHECK (true);
 
+-- เปิดใช้งาน Realtime สำหรับตาราง timers
+ALTER PUBLICATION supabase_realtime ADD TABLE timers;
+
 -- ============================================
 -- ข้อมูลที่เก็บในตาราง:
 -- ============================================
