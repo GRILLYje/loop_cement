@@ -37,48 +37,75 @@ function App() {
           table: 'timers'
         },
         (payload) => {
-          console.log('Realtime update:', payload)
+          console.log('Realtime update:', payload.eventType, payload)
           
           if (payload.eventType === 'DELETE') {
             // Remove deleted timer
-            setTimers(prevTimers => prevTimers.filter(t => t.id !== payload.old.id))
-            if (intervalRefs.current[payload.old.id]) {
-              clearInterval(intervalRefs.current[payload.old.id])
-              delete intervalRefs.current[payload.old.id]
-            }
-          } else if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
-            // Update or add timer
-            const updatedTimer: Timer = {
-              id: payload.new.id,
-              name: payload.new.name,
-              initialSeconds: payload.new.initial_seconds,
-              remainingSeconds: payload.new.remaining_seconds,
-              status: payload.new.status as Timer['status']
-            }
-            
-            setTimers(prevTimers => {
-              const existingIndex = prevTimers.findIndex(t => t.id === updatedTimer.id)
-              if (existingIndex >= 0) {
-                // Update existing timer
-                const updated = [...prevTimers]
-                updated[existingIndex] = updatedTimer
-                
-                // Handle status changes
-                if (updatedTimer.status !== 'running' && intervalRefs.current[updatedTimer.id]) {
-                  clearInterval(intervalRefs.current[updatedTimer.id])
-                  delete intervalRefs.current[updatedTimer.id]
-                }
-                
-                return updated
-              } else {
-                // Add new timer
-                return [...prevTimers, updatedTimer]
+            const deletedId = (payload.old as any)?.id
+            if (deletedId) {
+              setTimers(prevTimers => prevTimers.filter(t => t.id !== deletedId))
+              if (intervalRefs.current[deletedId]) {
+                clearInterval(intervalRefs.current[deletedId])
+                delete intervalRefs.current[deletedId]
               }
-            })
+            }
+          } else if (payload.eventType === 'INSERT') {
+            // Add new timer
+            if (payload.new) {
+              const newTimer: Timer = {
+                id: payload.new.id,
+                name: payload.new.name,
+                initialSeconds: payload.new.initial_seconds,
+                remainingSeconds: payload.new.remaining_seconds,
+                status: payload.new.status as Timer['status']
+              }
+              
+              setTimers(prevTimers => {
+                // Check if timer already exists (avoid duplicates)
+                const exists = prevTimers.find(t => t.id === newTimer.id)
+                if (!exists) {
+                  return [newTimer, ...prevTimers] // Add to beginning
+                }
+                return prevTimers
+              })
+            }
+          } else if (payload.eventType === 'UPDATE') {
+            // Update existing timer
+            if (payload.new) {
+              const updatedTimer: Timer = {
+                id: payload.new.id,
+                name: payload.new.name,
+                initialSeconds: payload.new.initial_seconds,
+                remainingSeconds: payload.new.remaining_seconds,
+                status: payload.new.status as Timer['status']
+              }
+              
+              setTimers(prevTimers => {
+                const existingIndex = prevTimers.findIndex(t => t.id === updatedTimer.id)
+                if (existingIndex >= 0) {
+                  // Update existing timer
+                  const updated = [...prevTimers]
+                  updated[existingIndex] = updatedTimer
+                  
+                  // Handle status changes
+                  if (updatedTimer.status !== 'running' && intervalRefs.current[updatedTimer.id]) {
+                    clearInterval(intervalRefs.current[updatedTimer.id])
+                    delete intervalRefs.current[updatedTimer.id]
+                  }
+                  
+                  return updated
+                } else {
+                  // Timer not found, add it (shouldn't happen but handle it)
+                  return [updatedTimer, ...prevTimers]
+                }
+              })
+            }
           }
         }
       )
-      .subscribe()
+      .subscribe((status) => {
+        console.log('Realtime subscription status:', status)
+      })
 
     // Cleanup subscription on unmount
     return () => {
@@ -250,11 +277,28 @@ function App() {
       status: 'idle'
     }
 
-    setTimers([...timers, newTimer])
-    await saveTimerToDB(newTimer)
-    setNewTimerName('')
-    setNewTimerMinutes(0)
-    setNewTimerSeconds(30)
+    // Save to database first - Realtime will handle adding to state
+    try {
+      const { error } = await supabase
+        .from('timers')
+        .insert({
+          id: newTimer.id,
+          name: newTimer.name,
+          initial_seconds: newTimer.initialSeconds,
+          remaining_seconds: newTimer.remainingSeconds,
+          status: newTimer.status
+        })
+
+      if (error) throw error
+
+      // Clear form - Realtime subscription will add timer to state
+      setNewTimerName('')
+      setNewTimerMinutes(0)
+      setNewTimerSeconds(30)
+    } catch (error) {
+      console.error('Error creating timer:', error)
+      alert('เกิดข้อผิดพลาดในการสร้าง Timer')
+    }
   }
 
   const startTimer = async (id: string) => {
@@ -331,12 +375,25 @@ function App() {
   }
 
   const deleteTimer = async (id: string) => {
+    // Clear interval first
     if (intervalRefs.current[id]) {
       clearInterval(intervalRefs.current[id])
       delete intervalRefs.current[id]
     }
-    setTimers(prevTimers => prevTimers.filter(timer => timer.id !== id))
-    await deleteTimerFromDB(id)
+
+    // Delete from database - Realtime will handle removing from state
+    try {
+      const { error } = await supabase
+        .from('timers')
+        .delete()
+        .eq('id', id)
+
+      if (error) throw error
+      // Realtime subscription will remove timer from state automatically
+    } catch (error) {
+      console.error('Error deleting timer:', error)
+      alert('เกิดข้อผิดพลาดในการลบ Timer')
+    }
   }
 
   const startEditTime = (id: string) => {
